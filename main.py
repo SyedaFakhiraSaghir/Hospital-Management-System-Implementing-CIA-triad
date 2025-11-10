@@ -279,6 +279,31 @@ def init_db():
         return False
 
 # ---------- security functions ----------
+def get_realtime_activity():
+    """get recent system activity for real-time monitoring"""
+    try:
+        conn = get_conn()
+        if conn:
+            # get activity from last 24 hours
+            cutoff_time = (datetime.now() - timedelta(hours=24)).isoformat()
+            query = """
+                SELECT 
+                    strftime('%H:00', timestamp) as hour,
+                    action,
+                    COUNT(*) as count
+                FROM logs 
+                WHERE timestamp > ?
+                GROUP BY hour, action
+                ORDER BY hour
+            """
+            df = pd.read_sql_query(query, conn, params=(cutoff_time,))
+            conn.close()
+            return df
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Activity Data Load Failed: {e}")
+        return pd.DataFrame()
+    
 def verify_password(password, hashed):
     """validate user credentials against stored hash"""
     try:
@@ -746,20 +771,50 @@ def main():
             else:
                 st.warning("Fernet Encryption Unavailable")
             
+            
             # audit log access
             st.markdown("**Audit And Monitoring**")
-            if st.button("View Activity Logs", use_container_width=True):
-                try:
-                    conn = get_conn()
-                    logs_df = pd.read_sql_query(
-                        "SELECT timestamp, username, role, action, details FROM logs ORDER BY timestamp DESC LIMIT 50", 
-                        conn
-                    )
-                    conn.close()
-                    st.dataframe(logs_df, use_container_width=True)
-                    st.markdown("**Integrity Audit Log** - All system actions recorded for accountability")
-                except Exception as e:
-                    st.error(f"Failed To Load Logs: {e}")
+            tab1, tab2 = st.tabs(["Real-time Activity", "Raw Logs"])
+
+            with tab1:
+                st.subheader("System Activity Dashboard")
+                
+                # real-time activity graph
+                activity_df = get_realtime_activity()
+                if not activity_df.empty:
+                    # create pivot table for stacked area chart
+                    pivot_df = activity_df.pivot_table(
+                        index='hour', 
+                        columns='action', 
+                        values='count', 
+                        fill_value=0
+                    ).reset_index()
+                    
+                    if not pivot_df.empty:
+                        st.area_chart(
+                            pivot_df.set_index('hour'),
+                            use_container_width=True,
+                            height=300
+                        )
+                        st.caption("System Activity Over Last 24 Hours")
+                    else:
+                        st.info("No activity data available for chart")
+                else:
+                    st.info("No recent system activity recorded")
+
+            with tab2:
+                if st.button("Load Detailed Logs", use_container_width=True):
+                    try:
+                        conn = get_conn()
+                        logs_df = pd.read_sql_query(
+                            "SELECT timestamp, username, role, action, details FROM logs ORDER BY timestamp DESC LIMIT 50", 
+                            conn
+                        )
+                        conn.close()
+                        st.dataframe(logs_df, use_container_width=True)
+                        st.markdown("**Integrity Audit Log** - All system actions recorded for accountability")
+                    except Exception as e:
+                        st.error(f"Failed To Load Logs: {e}")
             
             # data export functionality
             st.markdown("**Data Management**")
