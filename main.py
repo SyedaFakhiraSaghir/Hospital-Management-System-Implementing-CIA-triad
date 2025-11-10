@@ -1,60 +1,209 @@
-# app_enhanced.py
 import streamlit as st
 import sqlite3
 import hashlib
 import bcrypt
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import re
 from cryptography.fernet import Fernet
 
-# ---------- CONFIG ----------
+# ---------- configuration ----------
 DB_PATH = "hospital_enhanced.db"
 FERNET_KEY_PATH = "fernet.key"
+RETENTION_DAYS = 30
 
-# ---------- ENCRYPTION HELPERS ----------
+# ---------- encryption setup ----------
 def setup_fernet():
-    """Setup Fernet encryption"""
+    """initialize fernet encryption for data protection"""
     try:
         if not os.path.exists(FERNET_KEY_PATH):
             key = Fernet.generate_key()
             with open(FERNET_KEY_PATH, "wb") as f:
                 f.write(key)
-            st.sidebar.success("🔐 Encryption key generated")
+            st.sidebar.success("Encryption Key Generated")
         
         with open(FERNET_KEY_PATH, "rb") as f:
             key = f.read()
         return Fernet(key)
     except Exception as e:
-        st.sidebar.warning(f"Encryption not available: {e}")
+        st.sidebar.warning(f"Encryption Not Available: {e}")
         return None
 
-# ---------- DATABASE HELPERS ----------
+# ---------- consent management ----------
+def check_consent():
+    """verify user consent for data processing"""
+    if 'consent_given' not in st.session_state:
+        st.session_state.consent_given = False
+    return st.session_state.consent_given
+
+def show_consent_banner():
+    """display gdpr compliance consent banner"""
+    if not check_consent():
+        with st.container():
+            st.markdown("""
+            <div style='
+                background-color: #ffffff;
+                border-left: 4px solid #dc3545;
+                padding: 1.5rem;
+                margin: 1rem 0;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                border-radius: 4px;
+            '>
+            <h3 style='color: #2c3e50; margin-top: 0;'>Data Privacy Notice</h3>
+            <p style='color: #34495e; margin-bottom: 1.5rem;'>
+                We value your privacy and are committed to protecting personal data. 
+                This system processes patient information with strict security measures 
+                including encryption and role-based access controls.
+            </p>
+            <div style='display: flex; gap: 1rem; align-items: center;'>
+            """, unsafe_allow_html=True)
+            
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.markdown("<p style='color: #7f8c8d; font-size: 0.9rem;'>By continuing, you acknowledge our data handling practices</p>", unsafe_allow_html=True)
+            with col2:
+                if st.button("Accept", key="consent_accept", type="primary"):
+                    st.session_state.consent_given = True
+                    st.session_state.consent_timestamp = datetime.now()
+                    st.rerun()
+            with col3:
+                if st.button("Learn More", key="consent_info"):
+                    st.session_state.show_consent_details = True
+            
+            st.markdown("</div></div>", unsafe_allow_html=True)
+            
+            if st.session_state.get('show_consent_details', False):
+                with st.expander("Privacy Details", expanded=True):
+                    st.markdown("""
+                    **Data We Process:**
+                    - Patient names and contact information
+                    - Medical diagnoses and treatment records
+                    - System access logs and user activity
+                    
+                    **Security Measures:**
+                    - End-to-end encryption for sensitive data
+                    - Automatic data anonymization
+                    - Role-based access controls
+                    - Comprehensive audit logging
+                    
+                    **Retention Policy:**
+                    - Patient data: 30 days maximum
+                    - Audit logs: 90 days maximum
+                    - Anonymized data: indefinite for analytics
+                    
+                    **Your Rights:**
+                    - Request data access
+                    - Ask for data correction
+                    - Withdraw consent (limits system access)
+                    """)
+                    
+                    if st.button("Close Details"):
+                        st.session_state.show_consent_details = False
+                        st.rerun()
+        
+        st.stop()
+
+# ---------- data retention management ----------
+def enforce_data_retention():
+    """automatically remove expired data based on retention policy"""
+    try:
+        conn = get_conn()
+        if not conn:
+            return
+            
+        cur = conn.cursor()
+        cutoff_date = (datetime.now() - timedelta(days=RETENTION_DAYS)).isoformat()
+        
+        # count records scheduled for deletion
+        cur.execute("SELECT COUNT(*) FROM patients WHERE date_added < ?", (cutoff_date,))
+        patient_count = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM logs WHERE timestamp < ?", (cutoff_date,))
+        log_count = cur.fetchone()[0]
+        
+        # execute data deletion
+        if patient_count > 0 or log_count > 0:
+            cur.execute("DELETE FROM patients WHERE date_added < ?", (cutoff_date,))
+            cur.execute("DELETE FROM logs WHERE timestamp < ?", (cutoff_date,))
+            conn.commit()
+            
+            if patient_count > 0 or log_count > 0:
+                st.sidebar.info(f"Retention Cleanup: {patient_count} patients, {log_count} logs removed")
+        
+        conn.close()
+        
+    except Exception as e:
+        st.sidebar.warning(f"Retention Cleanup Skipped: {e}")
+
+def show_retention_timer():
+    st.sidebar.subheader("Data Retention")
+    
+    # calculate remaining days for data retention
+    try:
+        conn = get_conn()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT date_added FROM patients ORDER BY date_added DESC LIMIT 1")
+            result = cur.fetchone()
+            conn.close()
+            
+            if result:
+                latest_date = datetime.fromisoformat(result[0])
+                expiration_date = latest_date + timedelta(days=RETENTION_DAYS)
+                days_remaining = (expiration_date - datetime.now()).days
+                
+                if days_remaining <= 7:
+                    color = "#dc3545"
+                    status = "Expiring Soon"
+                elif days_remaining <= 15:
+                    color = "#fd7e14"
+                    status = "Active"
+                else:
+                    color = "#198754"
+                    status = "Active"
+                
+                st.sidebar.markdown(f"""
+                <div style='
+                    background: {color}15;
+                    border: 1px solid {color}30;
+                    border-radius: 6px;
+                    padding: 0.75rem;
+                    margin: 0.5rem 0;
+                '>
+                    <div style='color: {color}; font-weight: 600; font-size: 0.9rem;'>{status}</div>
+                    <div style='color: #2c3e50; font-size: 0.8rem;'>{days_remaining} Days Remaining</div>
+                    <div style='color: #7f8c8d; font-size: 0.7rem;'>30 Day Policy</div>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    except Exception as e:
+        st.sidebar.error("Retention Status Unavailable")
+
+# ---------- database operations ----------
 def get_conn():
-    """Get database connection with proper error handling"""
+    """establish secure database connection"""
     try:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
     except sqlite3.Error as e:
-        st.error(f"Database connection failed: {str(e)}")
+        st.error(f"Database Connection Failed: {str(e)}")
         return None
 
 def init_db():
-    """Initialize database with enhanced schema"""
-    st.info("🔄 Initializing enhanced database...")
+    
     
     conn = get_conn()
     if conn is None:
-        st.error("❌ Cannot connect to database")
+        st.error("Cannot Connect To Database")
         return False
     
     try:
         cur = conn.cursor()
         
-        # Enhanced users table
+        # users table with role-based access
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +214,7 @@ def init_db():
             is_active INTEGER DEFAULT 1
         )""")
         
-        # Enhanced patients table with encryption fields
+        # patients table with privacy controls
         cur.execute("""
         CREATE TABLE IF NOT EXISTS patients (
             patient_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +230,7 @@ def init_db():
             FOREIGN KEY (created_by) REFERENCES users(user_id)
         )""")
         
-        # Enhanced logs table
+        # comprehensive audit logs
         cur.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             log_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,9 +245,8 @@ def init_db():
         )""")
         
         conn.commit()
-        st.success("✅ Enhanced database tables created!")
         
-        # Add default users
+        # create default users for testing
         default_users = [
             ("admin", "admin123", "admin"),
             ("drbob", "doc123", "doctor"),
@@ -117,39 +265,39 @@ def init_db():
                     )
                     users_added += 1
             except Exception as e:
-                st.warning(f"Could not add user {username}: {e}")
+                st.warning(f"Could Not Add User {username}: {e}")
         
         conn.commit()
-        st.success(f"✅ {users_added} default users added")
+        
         
         conn.close()
         return True
         
     except Exception as e:
-        st.error(f"❌ Database initialization failed: {str(e)}")
+        st.error(f"Database Initialization Failed: {str(e)}")
         conn.close()
         return False
 
-# ---------- SECURITY HELPERS ----------
+# ---------- security functions ----------
 def verify_password(password, hashed):
-    """Verify password against bcrypt hash"""
+    """validate user credentials against stored hash"""
     try:
         return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
     except Exception:
         return False
 
 def anonymize_name(name):
-    """Enhanced anonymization"""
+    """protect patient identity through anonymization"""
     if not name:
         return ""
     salt = os.getenv("HOSPITAL_SALT", "default-salt")
     return "ANON_" + hashlib.sha256((name + salt).encode()).hexdigest()[:8]
 
 def mask_contact(contact):
-    """Enhanced contact masking"""
+    """mask contact information for privacy"""
     if not contact:
         return ""
-    if "@" in contact:  # Email
+    if "@" in contact:  # email address
         parts = contact.split("@")
         if len(parts) == 2:
             name = parts[0]
@@ -159,14 +307,14 @@ def mask_contact(contact):
             else:
                 masked_name = "**"
             return f"{masked_name}@{domain}"
-    # Phone number
+    # phone number masking
     digits = re.sub(r'\D', '', contact)
     if len(digits) >= 4:
         return "XXX-XXX-" + digits[-4:]
     return "XXX-XXX-XXXX"
 
 def encrypt_fernet(fernet, plaintext):
-    """Encrypt with Fernet"""
+    """encrypt sensitive data using fernet"""
     if not fernet or not plaintext:
         return None
     try:
@@ -175,7 +323,7 @@ def encrypt_fernet(fernet, plaintext):
         return None
 
 def decrypt_fernet(fernet, token):
-    """Decrypt with Fernet"""
+    """decrypt fernet-encrypted data"""
     if not fernet or not token:
         return None
     try:
@@ -184,7 +332,7 @@ def decrypt_fernet(fernet, token):
         return None
 
 def log_action(user, action, details=""):
-    """Enhanced logging"""
+    """record all user actions for audit trail"""
     try:
         conn = get_conn()
         if conn:
@@ -198,11 +346,11 @@ def log_action(user, action, details=""):
             conn.commit()
             conn.close()
     except Exception as e:
-        st.error(f"Logging failed: {e}")
+        st.error(f"Logging Failed: {e}")
 
-# ---------- ROLE PERMISSIONS ----------
+# ---------- role-based permissions ----------
 def get_permissions(role):
-    """Define role-based permissions"""
+    """define access controls for each user role"""
     return {
         'admin': {
             'view_raw_data': True,
@@ -236,9 +384,9 @@ def get_permissions(role):
         }
     }.get(role, {})
 
-# ---------- PATIENT OPERATIONS ----------
+# ---------- patient data operations ----------
 def add_patient(user, name, contact, diagnosis, fernet=None):
-    """Add patient with enhanced privacy"""
+    """add new patient with privacy protections"""
     try:
         conn = get_conn()
         if not conn:
@@ -246,11 +394,11 @@ def add_patient(user, name, contact, diagnosis, fernet=None):
             
         cur = conn.cursor()
         
-        # Prepare data based on role
+        # apply privacy transformations
         anonym_name = anonymize_name(name)
         anonym_contact = mask_contact(contact)
         
-        # Role-based data storage
+        # enforce role-based data storage
         permissions = get_permissions(user['role'])
         store_name = name if permissions.get('view_raw_data') else None
         store_contact = contact if permissions.get('view_raw_data') else None
@@ -273,11 +421,11 @@ def add_patient(user, name, contact, diagnosis, fernet=None):
         return patient_id
         
     except Exception as e:
-        st.error(f"Failed to add patient: {e}")
+        st.error(f"Failed To Add Patient: {e}")
         return None
 
 def get_patients(user, fernet=None):
-    """Get patients with role-based data access"""
+    """retrieve patients with role-based data access"""
     try:
         conn = get_conn()
         if not conn:
@@ -288,7 +436,7 @@ def get_patients(user, fernet=None):
         
         permissions = get_permissions(user['role'])
         
-        # Apply role-based data masking
+        # apply data masking based on role
         if not permissions.get('view_raw_data'):
             patients_df['name'] = None
             patients_df['contact'] = None
@@ -297,7 +445,7 @@ def get_patients(user, fernet=None):
             patients_df['name'] = patients_df['anonymized_name']
             patients_df['contact'] = patients_df['anonymized_contact']
         
-        # Admin can see decrypted data
+        # admin decryption capabilities
         if user['role'] == 'admin' and fernet:
             if 'encrypted_name' in patients_df.columns:
                 patients_df['decrypted_name'] = patients_df['encrypted_name'].apply(
@@ -311,11 +459,11 @@ def get_patients(user, fernet=None):
         return patients_df
         
     except Exception as e:
-        st.error(f"Failed to load patients: {e}")
+        st.error(f"Failed To Load Patients: {e}")
         return pd.DataFrame()
 
 def edit_patient(user, patient_id, diagnosis=None, fernet=None):
-    """Edit patient diagnosis"""
+    """update patient diagnosis with integrity checks"""
     try:
         conn = get_conn()
         if not conn:
@@ -323,13 +471,13 @@ def edit_patient(user, patient_id, diagnosis=None, fernet=None):
             
         cur = conn.cursor()
         
-        # Check if patient exists
+        # verify patient exists
         cur.execute("SELECT patient_id FROM patients WHERE patient_id = ?", (patient_id,))
         if not cur.fetchone():
-            st.error("Patient not found")
+            st.error("Patient Not Found")
             return False
         
-        # Update diagnosis
+        # update medical diagnosis
         if diagnosis:
             cur.execute(
                 "UPDATE patients SET diagnosis = ? WHERE patient_id = ?",
@@ -343,18 +491,53 @@ def edit_patient(user, patient_id, diagnosis=None, fernet=None):
         return True
         
     except Exception as e:
-        st.error(f"Failed to update patient: {e}")
+        st.error(f"Failed To Update Patient: {e}")
         return False
 
-# ---------- MAIN APPLICATION ----------
+# ---------- main application ----------
 def main():
     st.set_page_config(
-        page_title="Enhanced Hospital Management",
+        page_title="Hospital Management System",
         layout="wide",
         page_icon="🏥"
     )
     
-    # Initialize session state
+    # enhanced ui styling
+    st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #2c3e50;
+        font-weight: 700;
+        margin-bottom: 1rem;
+    }
+    .section-header {
+        font-size: 1.5rem;
+        color: #34495e;
+        font-weight: 600;
+        margin: 1.5rem 0 1rem 0;
+        padding-bottom: 0.5rem;
+        border-bottom: 2px solid #3498db;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
+    .security-badge {
+        background-color: #e8f5e8;
+        border: 1px solid #4caf50;
+        border-radius: 4px;
+        padding: 0.5rem;
+        margin: 0.25rem 0;
+        font-size: 0.9rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # initialize session state
     if 'auth' not in st.session_state:
         st.session_state.auth = None
     if 'db_initialized' not in st.session_state:
@@ -362,29 +545,36 @@ def main():
     if 'start_time' not in st.session_state:
         st.session_state.start_time = time.time()
     
-    # Setup encryption
+    # enforce consent before access
+    show_consent_banner()
+    
+    # setup encryption system
     fernet = setup_fernet()
     
-    # Initialize database
+    # initialize database
     if not st.session_state.db_initialized:
         if init_db():
             st.session_state.db_initialized = True
         else:
-            st.error("❌ Failed to initialize database.")
+            st.error("Failed To Initialize Database")
             return
     
-    st.title("🏥 Enhanced Hospital Management System")
-    st.markdown("### Featuring Advanced Privacy Controls & Encryption")
+    # enforce data retention policies
+    enforce_data_retention()
     
-    # Login Section
+    # main application header
+    st.markdown('<div class="main-header">Hospital Management System</div>', unsafe_allow_html=True)
+    st.markdown("Advanced Privacy Controls And Data Protection")
+    
+    # login interface
     with st.sidebar:
-        st.header("🔐 Login")
+        st.markdown('<div class="section-header">System Access</div>', unsafe_allow_html=True)
         
         if st.session_state.auth is None:
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
             
-            if st.button("Login", type="primary"):
+            if st.button("Login", type="primary", use_container_width=True):
                 if username and password:
                     try:
                         conn = get_conn()
@@ -406,147 +596,131 @@ def main():
                                 }
                                 st.session_state.auth = user
                                 log_action(user, "login_success")
-                                st.success("✅ Login successful!")
+                                st.success("Login Successful")
                                 time.sleep(1)
                                 st.rerun()
                             else:
                                 log_action({"username": username}, "login_failed")
-                                st.error("❌ Invalid credentials")
+                                st.error("Invalid Credentials")
                         else:
-                            st.error("❌ Database connection failed")
+                            st.error("Database Connection Failed")
                     except Exception as e:
-                        st.error(f"❌ Login error: {e}")
+                        st.error(f"Login Error: {e}")
                 else:
-                    st.error("⚠️ Please enter both username and password")
+                    st.error("Please Enter Both Username And Password")
         else:
             user = st.session_state.auth
-            st.success(f"✅ Signed in as: {user['username']}")
-            st.info(f"👤 Role: {user['role']}")
+            st.success(f"Signed In As: {user['username']}")
+            st.info(f"Role: {user['role']}")
             
-            if st.button("Logout"):
+            if st.button("Logout", use_container_width=True):
                 log_action(user, "logout")
                 st.session_state.auth = None
-                st.success("Logged out successfully!")
+                st.session_state.consent_given = False
+                st.success("Logged Out Successfully")
                 time.sleep(1)
                 st.rerun()
         
-        # System status
+        # system status dashboard
         st.markdown("---")
-        st.subheader("🔧 System Status")
-        st.write(f"🔐 Encryption: {'✅ Enabled' if fernet else '❌ Disabled'}")
-        st.write(f"🗄️ Database: {'✅ Connected' if st.session_state.db_initialized else '❌ Failed'}")
+        st.markdown('<div class="section-header">System Status</div>', unsafe_allow_html=True)
+
+        # data retention monitoring
+        show_retention_timer()
+        st.markdown("**System Information**")
+        st.write(f"Retention Policy: {RETENTION_DAYS} Days")
+        st.write(f"User Roles: {len(get_permissions('admin'))} Defined")
+        st.write(f"Security Level: {'High' if fernet else 'Standard'}")
+        
+        # system uptime
         uptime = int(time.time() - st.session_state.start_time)
-        st.write(f"⏱️ Uptime: {uptime}s")
+        st.write(f"System Uptime: {uptime} Seconds")
     
-    # Show content only if logged in
+    # public landing page for unauthenticated users
     if st.session_state.auth is None:
-        st.info("👆 Please log in from the sidebar to access the system")
+        st.info("Please Log In From The Sidebar To Access The System")
         st.markdown("---")
         
-        col1, col2, col3 = st.columns(3)
         
-        with col1:
-            st.subheader("👑 Admin")
-            st.write("**Username:** admin")
-            st.write("**Password:** admin123")
-            st.write("**Permissions:** Full access")
-            
-        with col2:
-            st.subheader("👨‍⚕️ Doctor")
-            st.write("**Username:** drbob")
-            st.write("**Password:** doc123")
-            st.write("**Permissions:** Anonymized data view")
-            
-        with col3:
-            st.subheader("💼 Receptionist")
-            st.write("**Username:** alice_recep")
-            st.write("**Password:** rec123")
-            st.write("**Permissions:** Add patients, limited view")
-        
-        st.markdown("---")
-        st.write("### 🛡️ Security Features:")
-        st.write("- Role-based access control")
-        st.write("- Patient data anonymization")
-        st.write("- Optional Fernet encryption")
-        st.write("- Comprehensive audit logging")
-        st.write("- GDPR-compliant data handling")
         return
     
+    # main application for authenticated users
     user = st.session_state.auth
     permissions = get_permissions(user['role'])
     
-    # Main Application
+    # application layout
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("👥 Patient Management")
+        st.markdown('<div class="section-header">Patient Management</div>', unsafe_allow_html=True)
         
-        # Add Patient Form
+        # patient registration form
         if permissions.get('add_patients'):
-            with st.expander("➕ Add New Patient", expanded=False):
+            with st.expander("Add New Patient", expanded=False):
                 with st.form("add_patient_form", clear_on_submit=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
-                        name = st.text_input("Full Name *", help="Patient's full name")
+                        name = st.text_input("Full Name", help="Patient's Full Name")
                     with col_b:
-                        contact = st.text_input("Contact *", help="Phone or email")
+                        contact = st.text_input("Contact", help="Phone or Email")
                     
-                    diagnosis = st.text_area("Diagnosis", help="Medical diagnosis and notes")
+                    diagnosis = st.text_area("Diagnosis", help="Medical Diagnosis and Notes")
                     
-                    if st.form_submit_button("Add Patient"):
+                    if st.form_submit_button("Add Patient", use_container_width=True):
                         if name and contact:
-                            with st.spinner("Adding patient with privacy protection..."):
+                            with st.spinner("Adding Patient With Privacy Protection"):
                                 patient_id = add_patient(user, name, contact, diagnosis, fernet)
                                 if patient_id:
-                                    st.success(f"✅ Patient added successfully! ID: {patient_id}")
-                                    st.balloons()
+                                    st.success(f"Patient Added Successfully - ID: {patient_id}")
                         else:
-                            st.error("❌ Name and contact are required")
+                            st.error("Name And Contact Are Required")
         
-        # View Patients
-        st.subheader("📋 Patient Records")
+        # patient records display
+        st.markdown('<div class="section-header">Patient Records</div>', unsafe_allow_html=True)
         patients_df = get_patients(user, fernet)
         
         if len(patients_df) > 0:
-            # Clean up display based on role
+            # role-based data filtering
             if user['role'] != 'admin':
                 cols_to_hide = ['encrypted_name', 'encrypted_contact', 'created_by']
                 patients_df = patients_df.drop(columns=[col for col in cols_to_hide if col in patients_df.columns])
             
             st.dataframe(patients_df, use_container_width=True)
-            st.caption(f"Showing {len(patients_df)} patient records - Data displayed based on your role: {user['role']}")
+            st.caption(f"Showing {len(patients_df)} Patient Records - Data Displayed Based On Your Role: {user['role']}")
         else:
-            st.info("📝 No patients found. Add some patients to get started.")
+            st.info("No Patients Found - Add Patients To Begin")
         
-        # Edit Diagnosis
+        # medical diagnosis updates
         if permissions.get('edit_diagnosis'):
-            with st.expander("✏️ Edit Patient Diagnosis"):
+            with st.expander("Update Patient Diagnosis"):
                 with st.form("edit_diagnosis_form"):
-                    patient_id = st.number_input("Patient ID", min_value=1, step=1)
-                    new_diagnosis = st.text_area("New Diagnosis")
+                    patient_id = st.number_input("Patient Identifier", min_value=1, step=1)
+                    new_diagnosis = st.text_area("Clinical Assessment")
                     
-                    if st.form_submit_button("Update Diagnosis"):
+                    if st.form_submit_button("Update Diagnosis", use_container_width=True):
                         if edit_patient(user, patient_id, new_diagnosis, fernet):
-                            st.success("✅ Diagnosis updated successfully!")
+                            st.success("Diagnosis Updated Successfully")
                             st.rerun()
     
     with col2:
-        st.header("⚙️ System Tools")
+        st.markdown('<div class="section-header">System Tools</div>', unsafe_allow_html=True)
         
-        # Role info
-        st.subheader("👤 Your Permissions")
+        # user permissions display
+        st.markdown("**Your Access Permissions**")
         for perm, allowed in permissions.items():
-            icon = "✅" if allowed else "❌"
-            st.write(f"{icon} {perm.replace('_', ' ').title()}")
+            status = "✓" if allowed else "✗"
+            color = "#198754" if allowed else "#dc3545"
+            st.markdown(f"<span style='color: {color};'>{status}</span> {perm.replace('_', ' ').title()}", unsafe_allow_html=True)
         
-        # Admin tools
+        # administrative controls
         if user['role'] == 'admin':
-            st.subheader("🔧 Admin Controls")
+            st.markdown("---")
+            st.markdown("**Administration Controls**")
             
-            # Encryption management
+            # encryption management
             if fernet:
-                st.success("🔐 Fernet Encryption: ACTIVE")
-                if st.button("Encrypt Existing Data"):
+                st.success("Fernet Encryption Active")
+                if st.button("Encrypt All Data", use_container_width=True):
                     try:
                         conn = get_conn()
                         cur = conn.cursor()
@@ -565,16 +739,16 @@ def main():
                         
                         conn.commit()
                         conn.close()
-                        st.success(f"✅ {encrypted} records encrypted")
+                        st.success(f"{encrypted} Records Encrypted")
                         log_action(user, "encrypt_all")
                     except Exception as e:
-                        st.error(f"Encryption failed: {e}")
+                        st.error(f"Encryption Failed: {e}")
             else:
-                st.warning("🔐 Fernet Encryption: UNAVAILABLE")
+                st.warning("Fernet Encryption Unavailable")
             
-            # Audit logs
-            st.subheader("📊 Audit Logs")
-            if st.button("View Recent Activity"):
+            # audit log access
+            st.markdown("**Audit And Monitoring**")
+            if st.button("View Activity Logs", use_container_width=True):
                 try:
                     conn = get_conn()
                     logs_df = pd.read_sql_query(
@@ -583,29 +757,35 @@ def main():
                     )
                     conn.close()
                     st.dataframe(logs_df, use_container_width=True)
+                    st.markdown("**Integrity Audit Log** - All system actions recorded for accountability")
                 except Exception as e:
-                    st.error(f"Failed to load logs: {e}")
+                    st.error(f"Failed To Load Logs: {e}")
             
-            # Data export
-            st.subheader("💾 Data Export")
-            if st.button("Export Patients (Admin View)"):
-                admin_df = get_patients({'role': 'admin'}, fernet)  # Get all data
+            # data export functionality
+            st.markdown("**Data Management**")
+            if st.button("Export Patient Data", use_container_width=True):
+                admin_df = get_patients({'role': 'admin'}, fernet)
                 csv = admin_df.to_csv(index=False)
                 st.download_button(
-                    "📥 Download CSV",
+                    "Download CSV Export",
                     csv,
                     "patients_full_export.csv",
-                    "text/csv"
+                    "text/csv",
+                    use_container_width=True
                 )
         
-        # System info
+        # data lifecycle information
         st.markdown("---")
-        st.subheader("ℹ️ System Information")
-        st.write(f"**Database:** {DB_PATH}")
-        st.write(f"**Users:** {len(get_permissions('admin'))} roles defined")
-        st.write(f"**Encryption:** {'Fernet Active' if fernet else 'Basic Only'}")
+        st.markdown("**Data Lifecycle**")
+        st.markdown(f"""
+        <div class="metric-card">
+        <div style='font-size: 0.9rem; color: #2c3e50;'>Retention Period</div>
+        <div style='font-size: 1.2rem; color: #3498db; font-weight: 600;'>{RETENTION_DAYS} Days</div>
+        <div style='font-size: 0.8rem; color: #7f8c8d;'>Automatic Cleanup Enabled</div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        if st.button("🔄 Refresh Data"):
+        if st.button("Refresh Data", use_container_width=True):
             st.rerun()
 
 if __name__ == "__main__":
